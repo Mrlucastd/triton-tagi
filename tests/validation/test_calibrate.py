@@ -16,8 +16,6 @@ Run with:
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -125,3 +123,64 @@ def test_surprise_lambda_monotone():
     mid = surprise_lambda(2.0, lam_max=0.1, tau=1.0)
     hi = surprise_lambda(10.0, lam_max=0.1, tau=1.0)
     assert 0.0 < mid < hi <= 0.1
+
+
+# ----------------------------------------------------------------------
+#  Data-driven (empirical) metric
+# ----------------------------------------------------------------------
+
+
+def test_data_metric_signal_unit_on_real_data():
+    """(I) metric='data': realized Var[z] on the calibration batch is ≈ 1 per output.
+
+    Uses a *correlated* input so the empirical whitener differs from the analytic
+    ``Gᶜ = v·I`` — the whole point of the data metric.
+    """
+    torch.manual_seed(0)
+    net = _build_net()
+    X = torch.randn(1024, 64, device=DEVICE)
+    X = X + 0.6 * X.roll(1, dims=1)                     # induce input correlation
+    calibrate(net, sigma2_obs=SIGMA2, metric="data", data_batch=X)
+
+    A = X
+    for layer in net.layers:
+        meta = getattr(layer, "_calib", None)
+        if meta is not None and meta["kind"] == "dense":
+            Ac = A - A.mean(dim=0)
+            Z = Ac @ layer.mw                          # centred pre-activation signal
+            signal = (Z * Z).mean(dim=0)               # Var[z] per output
+            torch.testing.assert_close(signal, torch.ones_like(signal), atol=2e-2, rtol=0)
+            A = A @ layer.mw + layer.mb                 # propagate calibrated mean
+        elif isinstance(layer, ReLU):
+            A = torch.relu(A)
+
+
+def test_data_metric_budget_equals_sigma_v2():
+    """(III) metric='data': AW + B ≈ σ_v² per layer (budget invariant holds)."""
+    torch.manual_seed(0)
+    net = _build_net()
+    X = torch.randn(1024, 64, device=DEVICE)
+    calibrate(net, sigma2_obs=SIGMA2, metric="data", data_batch=X)
+    for layer in net.layers:
+        meta = getattr(layer, "_calib", None)
+        if meta is None or meta["kind"] != "dense":
+            continue
+        g = meta["g_diag"]
+        aw = float((g * layer.Sw[:, 0]).sum().item())   # Σ_i Sw[i] · E[a_i²]
+        b = float(layer.Sb.flatten()[0].item())
+        assert abs((aw + b) - SIGMA2) < 1e-4
+
+
+def test_data_metric_requires_batch():
+    """metric='data' without a data_batch is a clear ValueError, not a silent no-op."""
+    net = _build_net()
+    with pytest.raises(ValueError, match="requires"):
+        calibrate(net, sigma2_obs=SIGMA2, metric="data")
+
+
+def test_online_config_validates_enums():
+    """Misconfigured string enums fail fast instead of silently no-op'ing."""
+    with pytest.raises(ValueError, match="mode"):
+        OnlineCalibration(mode="surprize")             # typo
+    with pytest.raises(ValueError, match="sigma_v_mode"):
+        OnlineCalibration(sigma_v_mode="homo")

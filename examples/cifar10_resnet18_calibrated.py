@@ -135,7 +135,7 @@ def train(net, online, x_train, y_train_oh, x_test, y_test_labels,
         t0 = time.perf_counter()
         perm = torch.randperm(x_train.size(0), device=device)
         x_s, y_s = x_train[perm], y_train_oh[perm]
-        lam_start = len(online.lambda_hist)
+        ep_lam_sum, ep_lam_n = 0.0, 0
 
         for i in range(0, len(x_s), batch_size):
             xb = x_s[i : i + batch_size]
@@ -143,6 +143,8 @@ def train(net, online, x_train, y_train_oh, x_test, y_test_labels,
                 xb = gpu_augment(xb)
             # sigma_v arg is ignored in homoscedastic mode (online owns σ_v).
             net.step(xb, y_s[i : i + batch_size], 0.0, online=online)
+            ep_lam_sum += online.last_lambda             # running mean λ for this epoch
+            ep_lam_n += 1
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -150,8 +152,7 @@ def train(net, online, x_train, y_train_oh, x_test, y_test_labels,
 
         acc = evaluate(net, x_test, y_test_labels)
         best_acc = max(best_acc, acc)
-        ep_lams = online.lambda_hist[lam_start:]
-        mean_lam = sum(ep_lams) / max(len(ep_lams), 1)
+        mean_lam = ep_lam_sum / max(ep_lam_n, 1)
         print(f"  {epoch:5d}  {acc*100:8.2f}%  {online.sigma_v:8.4f}  {mean_lam:8.4f}  {wall:6.2f}s")
         run.append_metrics(epoch, test_acc=acc, sigma_v=online.sigma_v, mean_lambda=mean_lam, wall_s=wall)
 
