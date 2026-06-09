@@ -6,7 +6,8 @@ operator's own mathematical invariants:
 
   (I)   signal = 1 per output            diag(mwᵀ Gᶜ mw) ≈ 1
   (II)  balanced per-parameter gain      K_b / K_w ≈ 1   (uniform across params)
-  (III) calibrated budget                AW + B ≈ σ_v²    (⇒ output gain J = ½)
+  (III) calibrated GLOBAL output budget  Sz_final ≈ σ_v²  (⇒ output gain J = ½);
+        per-layer local budgets c_global·budget_denom_ℓ vary by design
   online re-inflation lifts a collapsed variance toward its target
   the polar projection yields orthonormal columns (signal preservation)
 
@@ -22,6 +23,7 @@ import torch
 from triton_tagi import Linear, ReLU, Sequential, calibrate
 from triton_tagi.calibrate import (
     OnlineCalibration,
+    _forward_sz_analytic,
     online_recalibrate,
     polar_orth_columns,
     surprise_lambda,
@@ -62,18 +64,22 @@ def test_signal_is_unit_per_output():
 
 
 def test_budget_equals_sigma_v2():
-    """(III) AW + B ≈ σ_v² per layer  ⇒  output Kalman gain J = ½."""
+    """(III, global) Output budget Sz_final ≈ σ_v²  ⇒  output Kalman gain J = ½.
+
+    Condition (III) is a GLOBAL output condition: the per-layer LOCAL budgets
+    ``c_global·budget_denom_ℓ`` differ across layers, but their forward-amplified
+    sum at the network output equals σ_v² (the only quantity that feeds J).
+    """
     net = _build_net()
     calibrate(net, sigma2_obs=SIGMA2, metric="analytic")
-    for layer in net.layers:
-        meta = getattr(layer, "_calib", None)
-        if meta is None or meta["kind"] != "dense":
-            continue
-        g = meta["g_diag"]
-        sw_col = layer.Sw[:, 0]                          # Sw is uniform across outputs
-        aw = float((g * sw_col).sum().item())           # Σ_i Sw[i] · E[a_i²]
-        b = float(layer.Sb.flatten()[0].item())
-        assert abs((aw + b) - SIGMA2) < 1e-4
+
+    c_global = SIGMA2 / net._calib_A
+    for m in _dense_metas(net):                          # every layer shares one gain
+        assert m["c"] == pytest.approx(c_global, rel=1e-9)
+
+    sz_final = _forward_sz_analytic(net, c=c_global)     # = c_global · A(net)
+    assert abs(sz_final - SIGMA2) < 1e-6
+    assert abs(sz_final / (sz_final + SIGMA2) - 0.5) < 1e-6
 
 
 def test_gain_balance_is_unity():
@@ -95,7 +101,10 @@ def test_online_reinflation_lifts_collapsed_variance():
     """Online T re-inflates a collapsed posterior toward its calibrated target."""
     net = _build_net()
     calibrate(net, sigma2_obs=SIGMA2, metric="analytic")
-    cfg = OnlineCalibration(mode="const", lam=0.5, project=False)
+    # Online must use the SAME global gain c = σ_v²/A(net) that init used.
+    cfg = OnlineCalibration(
+        mode="const", lam=0.5, project=False, sigma_v2=SIGMA2, calib_A=net._calib_A
+    )
 
     dense = next(layer for layer in net.layers
                  if getattr(layer, "_calib", None) and layer._calib["kind"] == "dense")
@@ -156,19 +165,18 @@ def test_data_metric_signal_unit_on_real_data():
 
 
 def test_data_metric_budget_equals_sigma_v2():
-    """(III) metric='data': AW + B ≈ σ_v² per layer (budget invariant holds)."""
+    """(III, global) metric='data': output budget Sz_final ≈ σ_v² (J = ½)."""
     torch.manual_seed(0)
     net = _build_net()
     X = torch.randn(1024, 64, device=DEVICE)
     calibrate(net, sigma2_obs=SIGMA2, metric="data", data_batch=X)
-    for layer in net.layers:
-        meta = getattr(layer, "_calib", None)
-        if meta is None or meta["kind"] != "dense":
-            continue
-        g = meta["g_diag"]
-        aw = float((g * layer.Sw[:, 0]).sum().item())   # Σ_i Sw[i] · E[a_i²]
-        b = float(layer.Sb.flatten()[0].item())
-        assert abs((aw + b) - SIGMA2) < 1e-4
+
+    c_global = SIGMA2 / net._calib_A
+    for m in _dense_metas(net):
+        assert m["c"] == pytest.approx(c_global, rel=1e-9)
+
+    sz_final = _forward_sz_analytic(net, c=c_global)
+    assert abs(sz_final - SIGMA2) < 1e-6
 
 
 def test_data_metric_requires_batch():

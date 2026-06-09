@@ -84,48 +84,22 @@ dominates. This is the `K_b/K_w → 1` invariant in the verification table.
 
 ### (III) Calibrated budget = σ_v²  →  output Kalman gain `J = ½`
 
-Condition (III) is a **global output** condition, not a per-layer one. The
-quantity that must equal `σ_v²` is the *network output's* total epistemic variance
-`S_z^final` — the variance that sits in the output Kalman gain — **not** any single
-layer's local budget.
-
-**Per-layer local budget.** With (II), one layer's *own* budget contribution is
+The output's epistemic variance is `S_z = Σ_j g_j σ²_{W,j} + σ²_b`. Substituting (II):
 
 ```
-S_z^(ℓ)_own = Σ_j g_j (c/√g_j) + c = c (Σ_j √g_j + 1) = c · budget_denom_ℓ
+S_z = Σ_j g_j (c/√g_j) + c = c (Σ_j √g_j + 1)
 ```
 
-**Why local ≠ global.** TAGI's forward pass *accumulates* epistemic variance
-through depth: a Conv/Linear layer propagates the upstream variance amplified by
-`Σ_i μ_w[i,j]² = 1/v_analytic` (condition I), ReLU multiplies it by
-`_VAR_A_RELU = 1/2 − 1/2π`, BatchNorm passes it through and adds its own budget,
-AvgPool divides by `k²`, and a ResBlock **adds** the skip and branch budgets
-(`var_a += var_s`, TAGI's diagonal merge — which double-counts the shared input,
-overestimating variance). Across a deep ResNet these factors compound, so setting
-each layer's *local* budget to `σ_v²` makes the output budget blow up to
-`millions × σ_v²`, driving `J → 0` and killing learning from the first batch.
-
-**The global fix.** Because the input is deterministic (`S_z = 0`) and every
-propagation formula is linear in `S_z`, the output budget with one shared gain `c`
-is exactly linear:
+Pick the single scalar `c` so the whole budget equals the observation noise:
 
 ```
-S_z^final(c) = c · A(net)
-```
-
-where `A(net)` is a purely architectural amplification constant — the output
-variance produced by propagating a **unit budget** (`c = 1`) forward through the
-network with those same analytic formulas (`_forward_sz_analytic`). The unique
-global gain that calibrates the output is then closed-form:
-
-```
-c_global = σ_v² / A(net)     ⇒     S_z^final = σ_v²
+c = σ_v² / (Σ_j √g_j + 1)     ⇒     S_z = σ_v²
 ```
 
 The output **Kalman gain** that scales the innovation `(y − μ_z)` is then
 
 ```
-J = S_z^final / (S_z^final + σ_v²) = σ_v² / (σ_v² + σ_v²) = ½
+J = S_z / (S_z + σ_v²) = σ_v² / (σ_v² + σ_v²) = ½
 ```
 
 **Why ½.** The network starts *exactly half-confident*. With `J → 0` the prior is
@@ -133,14 +107,9 @@ frozen and ignores data; with `J → 1` it over-commits to the first batch. `J =
 is the balanced, maximal-information starting point — the Bayesian analogue of a
 well-chosen learning rate, but derived rather than tuned.
 
-> One **global** scalar `c_global` (shared by every layer) fixes (II) and (III)
-> jointly; the per-layer `budget_denom_ℓ` now only sets the `1/√g_j` *shape* of each
-> Sw row, not its magnitude. `A(net)` is architectural (independent of the weights
-> and of `σ_v²`), so it is computed once at init and stored (`net._calib_A`,
-> `OnlineCalibration.calib_A`). Online, `c_global = σ_v² / A(net)` is recomputed
+> One scalar `c` per layer fixes (II) and (III) jointly. `c` is recomputed online
 > from the live `σ_v²` estimate (below), so `J = ½` keeps holding as the noise is
-> learned. The per-layer local budgets `c_global · budget_denom_ℓ` therefore differ
-> from layer to layer — this is correct and expected.
+> learned.
 
 ---
 
@@ -155,13 +124,12 @@ The textbook Kalman remedy is a **predict step that adds process noise** `Q`:
 that injection, written as a relaxation toward the calibrated prior `S_target`:
 
 ```
-(S)   σ² ← (1 − λ)·σ²  +  λ·S_target ,     S_target = c_global/√g  (weights),  c_global (bias)
+(S)   σ² ← (1 − λ)·σ²  +  λ·S_target ,     S_target = c/√g  (weights),  c (bias)
 ```
 
 `λ = 0` → vanilla TAGI (monotone collapse). `λ → 1` → reset to the calibrated
-prior (`J → ½`). `λ` is the forgetting rate, and `S_target` uses the single global
-gain `c_global = σ_v²/A(net)` from (II)+(III), so re-inflation restores the OUTPUT
-budget `S_z^final = σ_v²` and `J = ½`.
+prior (`J → ½`). `λ` is the forgetting rate, and `S_target` is exactly the
+init target from (II)+(III), so re-inflation restores `Var[z] = 1` and `J = ½`.
 
 ### Surprise-driven λ — adaptive `Q`, no schedule
 
@@ -201,80 +169,11 @@ So `σ_v²` is **inferred**, not set, and it can be input-dependent (heterosceda
 With `sigma_v_mode="heteroscedastic"` the online operator defers the budget's noise
 to this AGVI head.
 
-#### AGVI extension of condition (III): initialising J = ½
-
-For AGVI the output Kalman gain for the **mean head** is:
-
-```
-J_mean = S_z / (S_z + E[V²])
-```
-
-where `S_z` is the epistemic budget and `E[V²]` the AGVI-predicted aleatoric noise.
-For `J_mean = ½` at initialisation we need:
-
-```
-S_z_init = E[V²]_init                                         (III-AGVI)
-```
-
-The calibration already sets `S_z_init = σ_v²` (condition III).  So the AGVI noise
-head must also start at `E[V²]_init = σ_v²`.
-
-With `EvenSoftplus`, the Muon centering step enforces `E[mz_odd] = 0` after every
-projection.  Left alone, this gives:
-
-```
-E[V²]_init = softplus(0) ≈ log 2 ≈ 0.693   ≠   σ_v²
-```
-
-The mismatch breaks `J = ½` at init and — more critically — causes the re-inflation
-feedback to diverge: re-inflating all L layers to match a budget that no longer
-equals `E[V²]` amplifies the second-order correction `0.5·S_z·σ(mz)·(1−σ(mz))`
-across every layer, making the recurrence factor `r = 1 − ρ + ρ·L·0.125 > 1`.
-
-**Fix: a fixed pre-activation offset `noise_mu` inside `EvenSoftplus`.**
-
-```
-noise_mu = softplus⁻¹(σ_v²) = log(exp(σ_v²) − 1)
-```
-
-The kernel computes `effective_mz_odd = mz_odd + noise_mu` before applying
-softplus.  After Muon centering restores `E[mz_odd] = 0`:
-
-```
-E[V²] = softplus(0 + noise_mu) = softplus(softplus⁻¹(σ_v²)) = σ_v²   ✓
-```
-
-The offset is a **scalar constant**, not a trainable parameter.  It lives inside
-`EvenSoftplus`, is invisible to the weight update and to Muon, and requires no
-per-step correction.  Usage:
-
-```python
-EvenSoftplus(half_width=K, noise_mu=math.log(math.expm1(sigma2_obs)))
-```
-
-> **Gradient tradeoff.**  The EvenSoftplus Jacobian for the noise head is
-> `J_bp = sigmoid(mz_odd + noise_mu)`.  With `E[mz_odd] = 0`:
-> `J_bp ≈ sigmoid(softplus⁻¹(σ_v²)) ≈ 1 − e^{−σ_v²} ≈ σ_v²` for small `σ_v²`.
-> Small `σ_v²` (e.g. 0.001) gives `J_bp ≈ 0.001` — the noise head learns 500× slower
-> than the mean head.  This is expected: a tight prior (`σ_v²` small) means the
-> network already "knows" the noise is small and only fine-tunes it.  For fast noise
-> adaptation choose `σ_v² ≈ log 2` (natural EvenSoftplus scale, `J_bp = 0.5`).
-
-> **Online re-inflation for AGVI.**  `cfg.sigma_v2` must track the **same**
-> σ_v² that sits in the Kalman gain denominator:
-> `var_sum = var_a_col + mu_v2_bar_tilde` (observation.py).
-> `mu_v2_bar_tilde` is the batch-mean of the odd output columns after EvenSoftplus
-> (`y_pred_mu[..., 1::2]`), i.e. the actual `E[V²]` the AGVI kernel consumed.
-> `update_sigma_v2` maintains a slow EMA of that value so the global re-inflation
-> target `c_global = cfg.sigma_v2 / A(net)` stays aligned with the live noise
-> prediction and `J = ½` is preserved as the AGVI head learns.  The `noise_mu` offset is still
-> required at init (so that `E[V²]_init = σ_v²_seed` before the EMA has warmed up).
-
 > **Homoscedastic fallback** (`sigma_v_mode="homoscedastic"`, used by the CIFAR
 > example) — for nets *without* a V2 head. A method-of-moments running estimate
 > `σ̂_v² ← (1 − ρ)·σ̂_v² + ρ·max(E[(y − μ)²] − E[Var_z], floor)` (total residual minus
-> epistemic). This is a convenience heuristic, **not AGVI**; the global budget target
-> `c_global = σ̂_v²/A(net)` tracks it so the OUTPUT `J = ½` is preserved.
+> epistemic). This is a convenience heuristic, **not AGVI**; the budget target
+> `c = σ̂_v²/(Σ√g + 1)` tracks it so `J = ½` is preserved.
 
 ---
 

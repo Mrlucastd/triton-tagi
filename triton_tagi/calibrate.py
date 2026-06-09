@@ -365,6 +365,115 @@ def _make_generator(seed: int | None, device, offset: int) -> torch.Generator | 
     return gen
 
 
+# ----------------------------------------------------------------------
+#  Global budget — forward epistemic-variance sensitivity pass
+# ----------------------------------------------------------------------
+#
+#  Condition (III) is a GLOBAL output condition, not a per-layer one. TAGI's
+#  forward pass accumulates epistemic variance through depth, so the output's
+#  total budget ``Sz_final`` is NOT the last layer's own contribution — it is the
+#  sum of every layer's budget amplified by all the layers downstream of it.
+#
+#  Because the network input is deterministic data (``Sa = 0`` in
+#  ``Sequential.forward``), the ONLY source of epistemic variance is the per-layer
+#  weight/bias budget, and every TAGI variance-propagation formula is linear in
+#  ``Sz``. With every layer sharing one scalar gain ``c`` (so each own budget is
+#  ``c · budget_denom_ℓ``), the final output budget is therefore exactly linear:
+#
+#       Sz_final(c) = c · A(net)
+#
+#  where ``A(net)`` is a purely architectural amplification constant obtained by
+#  propagating a UNIT budget (c = 1) forward with the same analytic formulas TAGI
+#  uses at runtime. The unique global gain that makes ``Sz_final = σ_v²`` (hence
+#  output Kalman gain ``J = ½``) is then closed-form:
+#
+#       c_global = σ_v² / A(net)
+
+
+def _sz_forward_step(layer, S_in: float, c: float) -> float:
+    """Propagate a scalar per-element epistemic variance through one layer.
+
+    Uses the SAME analytic moment formulas the runtime kernels use, evaluated at
+    the calibrated fixed point (means centred ⇒ pre-activations zero-mean; the
+    per-channel BN mean path unit-variance ⇒ ``run_s ≈ 1``; uniform per-element
+    variance). Every rule is linear in ``S_in`` and in the budget gain ``c``.
+
+        Conv2D / Linear : Sz_out = Sz_in · (1/v_analytic) + c · budget_denom
+                          (Σ_i μ_w[i,j]² = 1/v_analytic from condition I;
+                           own budget Σ_i g_i·Sw + Sb = c·budget_denom)
+        BatchNorm2D     : Sz_out = Sz_in + c · budget_denom   (budget_denom = 2)
+                          (μ_γ = 1, μ̂ ≈ 0, run_s ≈ 1 ⇒ pass-through + own budget)
+        ReLU            : Sz_out = _VAR_A_RELU · Sz_in   (Var[ReLU(N(0,Sz))])
+        AvgPool2D       : Sz_out = Sz_in · (k²·var_scale)  (= Sz_in/k² independent)
+        ResBlock        : recurse main & skip/proj paths from the same Sz_in, then
+                          ADD (mirrors ``var_a += var_s`` — TAGI's diagonal merge)
+        Flatten / EvenSoftplus / Remax / other : identity (no budget)
+    """
+    from .layers.avgpool2d import AvgPool2D
+    from .layers.relu import ReLU
+    from .layers.resblock import ResBlock
+
+    meta = getattr(layer, "_calib", None)
+    if meta is not None:
+        if meta["kind"] == "norm":
+            return S_in + c * meta["budget_denom"]
+        return S_in / meta["v_analytic"] + c * meta["budget_denom"]
+
+    if isinstance(layer, ReLU):
+        return _VAR_A_RELU * S_in
+    if isinstance(layer, AvgPool2D):
+        k2 = float(layer.k * layer.k)
+        var_scale = 1.0 / k2 if layer.spatial_correlation else 1.0 / (k2 * k2)
+        return S_in * (k2 * var_scale)
+    if isinstance(layer, ResBlock):
+        S_main = S_in
+        for sub in layer._main_layers:
+            S_main = _sz_forward_step(sub, S_main, c)
+        if layer.use_projection:
+            S_skip = S_in
+            for sub in layer._proj_layers:
+                S_skip = _sz_forward_step(sub, S_skip, c)
+        else:
+            S_skip = S_in
+        return S_main + S_skip
+    return S_in  # Flatten, EvenSoftplus, Remax, … — moment pass-through, no budget
+
+
+def _forward_sz_analytic(net, c: float = 1.0) -> float:
+    """Total output epistemic variance from a UNIT budget = the amplification A(net).
+
+    Walks the structured ``net.layers`` (descending into ResBlocks) from the
+    deterministic input (``Sz = 0``), threading the scalar epistemic variance
+    through :func:`_sz_forward_step`. With ``c = 1`` the return value is the purely
+    architectural constant ``A(net)`` such that ``Sz_final(c) = c · A(net)``.
+    """
+    S = 0.0
+    for layer in net.layers:
+        S = _sz_forward_step(layer, S, c)
+    return S
+
+
+def _apply_global_budget(net, sigma2_obs: float) -> float:
+    """Rewrite every layer's Sw/Sb with the global gain ``c_global = σ_v²/A(net)``.
+
+    Pass 2+3 of calibration: compute the architectural amplification ``A`` from the
+    means/shapes already set by the per-layer pass, then re-inflate every calibrated
+    layer with the single global gain so the OUTPUT budget equals ``σ_v²`` exactly
+    (``J = ½`` at the head). ``A`` is attached as ``net._calib_A`` for the online
+    operator, which must use the same global formula as ``σ_v²`` adapts.
+    """
+    A = _forward_sz_analytic(net, c=1.0)
+    c_global = sigma2_obs / A if A > 0.0 else sigma2_obs
+    for layer in _iter_learnable(net.layers):
+        meta = getattr(layer, "_calib", None)
+        if meta is None:
+            continue
+        _reinflate_layer(layer, 1.0, c_global)   # lam = 1 ⇒ overwrite Sw/Sb with target
+        meta["c"] = c_global                     # online tracks the global gain, not local
+    net._calib_A = A
+    return A
+
+
 def calibrate(
     net,
     *,
@@ -443,6 +552,8 @@ def calibrate(
         layer._calib = meta
         metas.append(meta)
 
+    # ── Pass 2+3 — global budget: Sz_final = σ_v² (output Kalman gain J = ½) ──
+    _apply_global_budget(net, sigma2_obs)
     return metas
 
 
@@ -521,6 +632,8 @@ def _calibrate_data(net, *, sigma2_obs: float, data_batch: Tensor, seed: int | N
         else:
             A = _propagate_det(layer, A)
 
+    # ── Pass 2+3 — global budget: Sz_final = σ_v² (output Kalman gain J = ½) ──
+    _apply_global_budget(net, sigma2_obs)
     return metas
 
 
@@ -553,17 +666,19 @@ def batch_chi2(y: Tensor, y_pred_mu: Tensor, y_pred_var: Tensor, sigma2: float) 
     return float(normalized_innovation(y, y_pred_mu, y_pred_var, sigma2).mean().item())
 
 
-def _reinflate_layer(layer, lam: float, sigma_v2: float) -> None:
+def _reinflate_layer(layer, lam: float, c: float) -> None:
     """(S) Re-inflate a layer's posterior variance toward its calibrated target.
 
-    The target gain ``c = σ_v² / budget_denom`` is recomputed from the *current*
-    ``sigma_v2`` (not the frozen init seed), so condition (III) — Σ epistemic = σ_v²
-    ⇒ output Kalman gain J = ½ — stays satisfied as the online σ_v² adapts.
+    ``c`` is the single GLOBAL budget gain ``c_global = σ_v² / A(net)`` shared by
+    every layer (not the obsolete per-layer ``σ_v²/budget_denom``). It is what makes
+    the network's OUTPUT epistemic variance equal ``σ_v²`` — condition (III) is a
+    global output condition, so the same ``c`` keeps ``J = ½`` at the head as the
+    online ``σ_v²`` adapts. The per-layer ``budget_denom`` no longer sets the
+    magnitude; only the ``1/√g`` *shape* of each Sw row survives (via ``sqrt_g``).
     """
     if lam <= 0:
         return
     meta = layer._calib
-    c = sigma_v2 / meta["budget_denom"]
     if meta["kind"] == "norm":
         reinflate_const_(layer.Sw, c, lam)
         reinflate_const_(layer.Sb, c, lam)
@@ -623,6 +738,10 @@ class OnlineCalibration:
         sigma_v2:    Running σ_v² estimate (mutable).
         sigma_v2_rho: EMA rate for the σ_v² estimate.
         sigma_v2_floor: Lower bound on σ_v².
+        calib_A:     Architectural epistemic amplification ``A(net)`` from
+                     :func:`calibrate` (``net._calib_A``). The online budget gain is
+                     ``c = σ_v² / A`` — the global form of condition (III). Defaults
+                     to 1.0 (no amplification) for non-calibrated / dense use.
         history_max: Max number of recent λ values to retain in ``lambda_hist``
                      (``None`` = unbounded). Bounded by default to cap memory on
                      long runs; per-step λ is always available via ``last_lambda``.
@@ -641,6 +760,7 @@ class OnlineCalibration:
     sigma_v2: float = 0.01
     sigma_v2_rho: float = 0.01
     sigma_v2_floor: float = 1e-4
+    calib_A: float = 1.0
     history_max: int | None = 10_000
     step_count: int = 0
     last_lambda: float = 0.0
@@ -664,14 +784,31 @@ class OnlineCalibration:
 
 
 def update_sigma_v2(cfg: OnlineCalibration, y: Tensor, y_pred_mu: Tensor, y_pred_var: Tensor) -> None:
-    """Method-of-moments σ_v² fallback: σ̂² = E[(y-μ)²] − E[Var_z] (EMA).
+    """Update the running σ_v² estimate used as the re-inflation budget.
 
-    A lightweight non-AGVI estimator for nets without a TAGI-V / AGVI variance head.
-    Skipped in heteroscedastic mode, where the AGVI head infers the noise instead.
+    The budget target must always reference the same σ_v² that appears in the
+    Kalman gain denominator, so that re-inflation keeps J = ½ as noise evolves.
+
+    Heteroscedastic / AGVI: the Kalman gain denominator is
+        var_sum = var_a_col + mu_v2   (observation.py)
+    where mu_v2 = mu_v2_bar_tilde = y_pred_mu[..., 1::2] (odd columns after
+    EvenSoftplus).  Track the batch-mean of that quantity as an EMA so that
+    c = cfg.sigma_v2 / budget_denom always equals mean(E[V²]) / budget_denom —
+    the same σ_v² the Kalman step itself used.
+
+    Homoscedastic: method-of-moments EMA  σ̂² ← (1−ρ)·σ̂² + ρ·max(E[(y−μ)²] − E[Var_z], floor).
     """
+    is_agvi = y_pred_mu.shape[-1] == 2 * y.shape[-1]
+
+    if cfg.sigma_v_mode == "heteroscedastic" and is_agvi:
+        ev2 = float(y_pred_mu[..., 1::2].mean().item())
+        ev2 = max(ev2, cfg.sigma_v2_floor)
+        cfg.sigma_v2 = (1 - cfg.sigma_v2_rho) * cfg.sigma_v2 + cfg.sigma_v2_rho * ev2
+        return
+
     if cfg.sigma_v_mode != "homoscedastic":
         return
-    if y_pred_mu.shape[-1] == 2 * y.shape[-1]:         # heteroscedastic head owns the noise
+    if is_agvi:
         return
     resid2 = float(squared_residual(y, y_pred_mu).mean().item())
     epist = float(y_pred_var.mean().item())
@@ -683,11 +820,14 @@ def online_recalibrate(net, lam: float, cfg: OnlineCalibration) -> None:
     """Apply the per-step online operator T to every calibrated layer."""
     cfg.step_count += 1
     sigma_v2 = max(cfg.sigma_v2, cfg.sigma_v2_floor)   # live budget (tracks online σ_v²)
+    # Global gain: c = σ_v² / A(net). A is architectural (weight-/σ_v²-independent),
+    # so the SAME global formula that init used keeps Sz_final = σ_v² (J = ½) online.
+    c_global = sigma_v2 / max(cfg.calib_A, 1e-12)
     do_proj = cfg.project and (cfg.step_count % max(cfg.every, 1) == 0)
     for layer in _iter_learnable(net.layers):
         if getattr(layer, "_calib", None) is None:
             continue
-        _reinflate_layer(layer, lam, sigma_v2)         # (S)
+        _reinflate_layer(layer, lam, c_global)         # (S)
         if do_proj:
             _project_layer(layer, cfg.beta)            # (μ) Muon — exact SVD polar factor
     cfg.last_lambda = lam
